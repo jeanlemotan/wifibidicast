@@ -30,7 +30,7 @@ extern "C"
 
 
 #define MAX_PACKET_LENGTH 4192
-#define MAX_USER_PACKET_LENGTH 1400
+#define MAX_USER_PACKET_LENGTH 700
 
 // this is the template radiotap header we send packets out with
 static constexpr uint8_t k_radiotap_header[] =
@@ -95,6 +95,16 @@ struct ASIO
     boost::asio::ip::udp::endpoint rx_endpoint;
     std::unique_ptr<boost::asio::ip::udp::socket> socket;
     std::array<uint8_t, MAX_USER_PACKET_LENGTH> rx_buffer;
+
+    std::mutex tx_buffer_pool_mutex;
+    typedef std::shared_ptr<std::vector<uint8_t>> TX_Buffer;
+    std::vector<TX_Buffer> tx_buffer_pool;
+
+    std::mutex tx_buffer_queue_mutex;
+    std::vector<TX_Buffer> tx_buffer_queue; //to send
+
+    TX_Buffer tx_buffer_in_transit;
+
 
     boost::function<void(const boost::system::error_code& error, std::size_t bytes_transferred)> tx_callback;
     boost::function<void(const boost::system::error_code& error, std::size_t bytes_transferred)> rx_callback;
@@ -185,6 +195,16 @@ static void asio_rx_callback(const boost::system::error_code& error, std::size_t
 }
 static void asio_tx_callback(const boost::system::error_code& error, std::size_t bytes_transferred)
 {
+    assert(g_asio.tx_buffer_in_transit);
+
+    //put it back in the pool
+    if (g_asio.tx_buffer_in_transit)
+    {
+        std::lock_guard<std::mutex> lg(g_asio.tx_buffer_pool_mutex);
+        g_asio.tx_buffer_pool.push_back(std::move(g_asio.tx_buffer_in_transit));
+    }
+
+    g_asio.tx_buffer_in_transit.reset();
 }
 
 
@@ -306,6 +326,27 @@ static bool process_rx_packet()
 
     //printf("rec %x bytes %d crc %d\n", seq_nr, bytes, checksum_correct);
 
+    ASIO::TX_Buffer buffer;
+    {
+        std::lock_guard<std::mutex> lg(g_asio.tx_buffer_pool_mutex);
+        if (g_asio.tx_buffer_pool.empty())
+        {
+            buffer = std::make_shared<ASIO::TX_Buffer::element_type>();
+        }
+        else
+        {
+            buffer = std::move(g_asio.tx_buffer_pool.back());
+            g_asio.tx_buffer_pool.pop_back();
+        }
+    }
+
+    buffer->resize(bytes);
+    std::copy(pu8Payload, pu8Payload + bytes, buffer->begin());
+    {
+        std::lock_guard<std::mutex> lg(g_asio.tx_buffer_queue_mutex);
+        g_asio.tx_buffer_queue.push_back(std::move(buffer));
+    }
+
     std::cout << "RX>>";
     std::copy(pu8Payload, pu8Payload + bytes, std::ostream_iterator<uint8_t>(std::cout));
     std::cout << "<<RX";
@@ -399,6 +440,18 @@ int main(int argc, char const* argv[])
                         return 1;
                     }
                 }
+            }
+        }
+
+        if (!g_asio.tx_buffer_in_transit)
+        {
+            std::lock_guard<std::mutex> lg(g_asio.tx_buffer_queue_mutex);
+            if (!g_asio.tx_buffer_queue.empty())
+            {
+                std::cout << "sending\n";
+                g_asio.tx_buffer_in_transit = g_asio.tx_buffer_queue.front();
+                g_asio.tx_buffer_queue.erase(g_asio.tx_buffer_queue.begin());
+                g_asio.socket->async_send_to(boost::asio::buffer(*g_asio.tx_buffer_in_transit), g_asio.tx_endpoint, g_asio.tx_callback);
             }
         }
     }
