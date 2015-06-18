@@ -7,6 +7,7 @@
 #include <boost/function.hpp>
 #include <boost/bind.hpp>
 #include <boost/thread.hpp>
+#include <boost/program_options.hpp>
 
 #include <stdint.h>
 #include <sys/types.h>
@@ -73,6 +74,7 @@ struct Penumbra_Radiotap_Header
 
 static bool g_exit = false;
 
+static size_t g_max_packet_size = MAX_USER_PACKET_LENGTH;
 
 struct PCAP
 {
@@ -109,19 +111,6 @@ struct ASIO
     boost::function<void(const boost::system::error_code& error, std::size_t bytes_transferred)> tx_callback;
     boost::function<void(const boost::system::error_code& error, std::size_t bytes_transferred)> rx_callback;
 } g_asio;
-
-
-static void usage()
-{
-    std::cout <<
-R"((c)2015 leflambeur. Based on befinitiv wifibroadcast.
-
-    Usage:
-        wifibidicast <interface>
-    Example:
-        wifibidicast wlan0
-)";
-}
 
 
 static bool prepare_filter()
@@ -178,6 +167,12 @@ static void asio_rx_callback(const boost::system::error_code& error, std::size_t
     }
     else
     {
+        if (bytes_transferred > g_max_packet_size)
+        {
+            std::cout << "Packet too big: " << bytes_transferred << ". Clamping to max packet size: " << g_max_packet_size;
+            bytes_transferred = g_max_packet_size;
+        }
+
         std::cout << "DATAGRAM>>";
         std::copy(g_asio.rx_buffer.data(), g_asio.rx_buffer.data() + bytes_transferred, std::ostream_iterator<uint8_t>(std::cout));
         std::cout << "<<DATAGRAM";
@@ -190,7 +185,7 @@ static void asio_rx_callback(const boost::system::error_code& error, std::size_t
             g_pcap.tx_data_available = true;
         }
 
-        g_asio.socket->async_receive_from(boost::asio::buffer(g_asio.rx_buffer), g_asio.rx_endpoint, g_asio.rx_callback);
+        g_asio.socket->async_receive_from(boost::asio::buffer(g_asio.rx_buffer.data(), g_max_packet_size), g_asio.rx_endpoint, g_asio.rx_callback);
     }
 }
 static void asio_tx_callback(const boost::system::error_code& error, std::size_t bytes_transferred)
@@ -232,7 +227,7 @@ static bool prepare_socket(uint16_t tx_port, uint16_t rx_port)
     g_asio.tx_callback = boost::bind(&asio_tx_callback, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred);
     g_asio.rx_callback = boost::bind(&asio_rx_callback, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred);
 
-    g_asio.socket->async_receive_from(boost::asio::buffer(g_asio.rx_buffer), g_asio.rx_endpoint, g_asio.rx_callback);
+    g_asio.socket->async_receive_from(boost::asio::buffer(g_asio.rx_buffer.data(), g_max_packet_size), g_asio.rx_endpoint, g_asio.rx_callback);
 
     return true;
 }
@@ -357,28 +352,57 @@ static bool process_rx_packet()
 
 int main(int argc, char const* argv[])
 {
-    if (argc == 1)
+    namespace po = boost::program_options;
+
+    po::options_description opt("Options");
+    opt.add_options()
+        ("help,h", "produce help message")
+        ("interface,i", po::value<std::string>()->required(), "wlan interface in monitor mode")
+        ("packet,p", po::value<size_t>(), "packet size");
+
+    po::variables_map vm;
+    try
     {
-        usage();
-        return 0;
+        po::store(po::command_line_parser(argc, argv).options(opt).run(), vm);
+        po::notify(vm);
+    }
+    catch (...)
+    {
+        std::cout << "(c)2015 leflambeur. Based on befinitiv wifibroadcast.\n";
+        std::cout << "Usage: " << argv[0] << " [options]\n";
+        std::cout << opt << "\n";
     }
 
-    umask(0000);
+    if (vm.count("help"))
+    {
+        std::cout << "(c)2015 leflambeur. Based on befinitiv wifibroadcast.\n";
+        std::cout << "Usage: " << argv[0] << " [options]\n";
+        std::cout << opt << "\n";
+        return 1;
+    }
 
-    std::cout << "Opening pcap on " << argv[1] << "\n";
+    std::string interface = vm["interface"].as<std::string>();
+    g_max_packet_size = vm.count("packet") ? vm["packet"].as<size_t>() : MAX_USER_PACKET_LENGTH;
+    if (g_max_packet_size > MAX_USER_PACKET_LENGTH)
+    {
+        std::cout << "Packet size is too big. Max is " << MAX_USER_PACKET_LENGTH << "\n";
+        return 1;
+    }
+
+    std::cout << "Opening pcap on " << interface << "\n";
 
     char pcap_error[PCAP_ERRBUF_SIZE] = {0};
-    g_pcap.pcap = pcap_open_live(argv[1], 800, 1, -1, pcap_error);
+    g_pcap.pcap = pcap_open_live(interface.c_str(), 800, 1, -1, pcap_error);
     if (g_pcap.pcap == nullptr)
     {
-        std::cout << "Unable to open interface " << argv[1] << " in pcap: " << pcap_error << "\n";
+        std::cout << "Unable to open interface " << interface << " in pcap: " << pcap_error << "\n";
         return (1);
     }
 
     std::cout << "Setting nonblocking pcap\n";
     if(pcap_setnonblock(g_pcap.pcap, 1, pcap_error) < 0)
     {
-        std::cout << "Error setting " << argv[1] << " to nonblocking mode: " << pcap_error << "\n";
+        std::cout << "Error setting " << interface << " to nonblocking mode: " << pcap_error << "\n";
         return 1;
     }
 
