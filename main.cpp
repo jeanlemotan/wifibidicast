@@ -25,19 +25,23 @@
 #include <string.h>
 #include <fcntl.h>
 
+
+//#define DEBUG_PCAP
+//#define DEBUG_ASIO
+
 extern "C"
 {
 #include "radiotap.h"
 }
 
 
-static constexpr uint16_t DEFAULT_RX_PORT = 8000;
+static constexpr uint16_t DEFAULT_PORT = 8000;
 static constexpr uint16_t DEFAULT_TX_PORT = 8001;
 
 static constexpr size_t MAX_PACKET_SIZE = 4192;
 static constexpr size_t MAX_USER_PACKET_SIZE = 1470;
 
-static constexpr size_t DEFAULT_RATE_HZ = 11000000;
+static constexpr size_t DEFAULT_RATE_HZ = 12000000;
 
 // this is the template radiotap header we send packets out with
 static constexpr uint8_t RADIOTAP_HEADER_original[] =
@@ -89,7 +93,8 @@ static bool g_loopback = false;
 
 static size_t g_max_packet_size = MAX_USER_PACKET_SIZE;
 static size_t g_rate_hz = DEFAULT_RATE_HZ;
-static uint8_t g_station_id = 0;
+
+static uint8_t g_local_id = 0;
 
 typedef std::shared_ptr<std::vector<uint8_t>> Buffer;
 
@@ -140,13 +145,13 @@ static bool prepare_filter()
     case DLT_PRISM_HEADER:
         std::cout << "DLT_PRISM_HEADER Encap\n";
         g_pcap._80211_header_length = 0x20; // ieee80211 comes after this
-        sprintf(program_src, "radio[0x4a:4]==0x13223344 && radio[0x4e:2] != 0x55%.2x", g_station_id);
+        sprintf(program_src, "radio[0x4a:4]==0x13223344 && radio[0x4e:2] != 0x55%.2x", g_local_id);
         break;
 
     case DLT_IEEE802_11_RADIO:
         std::cout << "DLT_IEEE802_11_RADIO Encap\n";
         g_pcap._80211_header_length = 0x18; // ieee80211 comes after this
-        sprintf(program_src, "ether[0x0a:4]==0x13223344 && ether[0x0e:2] != 0x55%.2x", g_station_id);
+        sprintf(program_src, "ether[0x0a:4]==0x13223344 && ether[0x0e:2] != 0x55%.2x", g_local_id);
         break;
 
     default:
@@ -193,26 +198,47 @@ static void prepare_radiotap_header(size_t rate_hz)
     RADIOTAP_HEADER.resize(1024);
     ieee80211_radiotap_header& hdr = reinterpret_cast<ieee80211_radiotap_header&>(*RADIOTAP_HEADER.data());
     hdr.it_version = 0;
-    hdr.it_present = (1 << IEEE80211_RADIOTAP_RATE)
+    hdr.it_present = 0
+                    | (1 << IEEE80211_RADIOTAP_RATE)
                     | (1 << IEEE80211_RADIOTAP_TX_FLAGS)
-                    | (1 << IEEE80211_RADIOTAP_RTS_RETRIES)
-                    | (1 << IEEE80211_RADIOTAP_DATA_RETRIES);
+//                    | (1 << IEEE80211_RADIOTAP_RTS_RETRIES)
+//                    | (1 << IEEE80211_RADIOTAP_DATA_RETRIES)
+//                    | (1 << IEEE80211_RADIOTAP_MCS)
+                    ;
 
     auto* dst = RADIOTAP_HEADER.data() + sizeof(ieee80211_radiotap_header);
     size_t idx = dst - RADIOTAP_HEADER.data();
 
-    //IEEE80211_RADIOTAP_RATE
-    radiotap_add_u8(dst, idx, std::min(static_cast<uint8_t>(rate_hz / 500000), uint8_t(1)));
-    //IEEE80211_RADIOTAP_TX_FLAGS
-    radiotap_add_u16(dst, idx, 0x18);
-    //IEEE80211_RADIOTAP_RTS_RETRIES
-    radiotap_add_u8(dst, idx, 0x0);
-    //IEEE80211_RADIOTAP_DATA_RETRIES
-    radiotap_add_u8(dst, idx, 0x0);
+    if (hdr.it_present & (1 << IEEE80211_RADIOTAP_RATE))
+    {
+        radiotap_add_u8(dst, idx, std::min(static_cast<uint8_t>(rate_hz / 500000), uint8_t(1)));
+    }
+    if (hdr.it_present & (1 << IEEE80211_RADIOTAP_TX_FLAGS))
+    {
+        radiotap_add_u16(dst, idx, IEEE80211_RADIOTAP_F_TX_NOACK); //used to be 0x18
+    }
+    if (hdr.it_present & (1 << IEEE80211_RADIOTAP_RTS_RETRIES))
+    {
+        radiotap_add_u8(dst, idx, 0x0);
+    }
+    if (hdr.it_present & (1 << IEEE80211_RADIOTAP_DATA_RETRIES))
+    {
+        radiotap_add_u8(dst, idx, 0x0);
+    }
+    if (hdr.it_present & (1 << IEEE80211_RADIOTAP_MCS))
+    {
+        radiotap_add_u8(dst, idx, IEEE80211_RADIOTAP_MCS_HAVE_MCS);
+        radiotap_add_u8(dst, idx, 0);
+        radiotap_add_u8(dst, idx, 18);
+    }
 
     //finish it
     hdr.it_len = static_cast<__le16>(idx);
     RADIOTAP_HEADER.resize(idx);
+
+
+//    RADIOTAP_HEADER.resize(sizeof(RADIOTAP_HEADER_original));
+//    memcpy(RADIOTAP_HEADER.data(), RADIOTAP_HEADER_original, sizeof(RADIOTAP_HEADER_original));
 }
 
 static void prepare_tx_packet_header(uint8_t* buffer)
@@ -245,22 +271,26 @@ static void asio_rx_callback(const boost::system::error_code& error, std::size_t
             bytes_transferred = g_max_packet_size;
         }
 
-//        std::cout << "DATAGRAM>>";
-//        std::copy(g_asio.rx_buffer.data() + g_pcap.tx_packet_header_length,
-//                  g_asio.rx_buffer.data() + g_pcap.tx_packet_header_length + bytes_transferred, std::ostream_iterator<uint8_t>(std::cout));
-//        std::cout << "<<DATAGRAM";
+#ifdef DEBUG_ASIO
+        std::cout << "ASIO RX>>";
+        std::copy(g_asio.rx_buffer.data() + g_pcap.tx_packet_header_length,
+                  g_asio.rx_buffer.data() + g_pcap.tx_packet_header_length + bytes_transferred, std::ostream_iterator<uint8_t>(std::cout));
+        std::cout << "<<ASIO RX";
+#endif
 
-        std::lock_guard<std::mutex> lg(g_pcap.pcap_mutex);
-        int isize = static_cast<int>(g_pcap.tx_packet_header_length + bytes_transferred);
-        int r = pcap_inject(g_pcap.pcap, g_asio.rx_buffer.data(), isize);
-        if (r <= 0)
         {
-            std::cout << "Trouble injecting packet: " << r << " / " << isize << " : " << pcap_geterr(g_pcap.pcap) << "\n";
-        }
+            std::lock_guard<std::mutex> lg(g_pcap.pcap_mutex);
+            int isize = static_cast<int>(g_pcap.tx_packet_header_length + bytes_transferred);
+            int r = pcap_inject(g_pcap.pcap, g_asio.rx_buffer.data(), isize);
+            if (r <= 0)
+            {
+                std::cout << "Trouble injecting packet: " << r << " / " << isize << " : " << pcap_geterr(g_pcap.pcap) << "\n";
+            }
 
-        if (r > 0 && r != isize)
-        {
-            std::cout << "Incomplete packet sent: " << r << " / " << isize << "\n";
+            if (r > 0 && r != isize)
+            {
+                std::cout << "Incomplete packet sent: " << r << " / " << isize << "\n";
+            }
         }
 
         static int xxx_data = 0;
@@ -299,10 +329,17 @@ static void asio_tx_callback(const boost::system::error_code& error, std::size_t
 
 static void send_asio_packet_locked()
 {
-    if (!g_asio.tx_buffer_queue.empty())
+    if (!g_asio.tx_buffer_queue.empty() && !g_asio.tx_buffer_in_transit)
     {
         //std::cout << "sending\n";
         g_asio.tx_buffer_in_transit = std::move(g_asio.tx_buffer_queue.front());
+
+#ifdef DEBUG_ASIO
+        std::cout << "ASIO TX>>";
+        std::copy(g_asio.tx_buffer_in_transit->begin(), g_asio.tx_buffer_in_transit->end(), std::ostream_iterator<uint8_t>(std::cout));
+        std::cout << "<<ASIO TX";
+#endif
+
         g_asio.tx_buffer_queue.pop_front();
         g_asio.socket->async_send_to(boost::asio::buffer(*g_asio.tx_buffer_in_transit), g_asio.tx_endpoint, g_asio.tx_callback);
     }
@@ -369,21 +406,19 @@ static bool process_rx_packet()
         return true;
     }
 
-    int header_len = (payload[2] + (payload[3] << 8));
+    size_t header_len = (payload[2] + (payload[3] << 8));
     if (pcap_packet_header->len < (header_len + g_pcap._80211_header_length))
     {
+        std::cout << "packet too small\n";
         return true;
     }
 
-    int bytes = pcap_packet_header->len - (header_len + g_pcap._80211_header_length);
-    if (bytes < 0)
-    {
-        return true;
-    }
+    size_t bytes = pcap_packet_header->len - (header_len + g_pcap._80211_header_length);
 
     ieee80211_radiotap_iterator rti;
     if (ieee80211_radiotap_iterator_init(&rti, (struct ieee80211_radiotap_header *)payload, pcap_packet_header->len) < 0)
     {
+        std::cout << "iterator null\n";
         return true;
     }
 
@@ -425,6 +460,12 @@ static bool process_rx_packet()
 
     //printf("rec %x bytes %d crc %d\n", seq_nr, bytes, checksum_correct);
 
+#ifdef DEBUG_PCAP
+    std::cout << "PCAP RX>>";
+    std::copy(payload, payload + bytes, std::ostream_iterator<uint8_t>(std::cout));
+    std::cout << "<<PCAP RX";
+#endif
+
     {
         std::lock_guard<std::mutex> lg(g_asio.tx_buffer_mutex);
         Buffer buffer;
@@ -461,10 +502,6 @@ static bool process_rx_packet()
         }
     }
 
-//    std::cout << "RX>>";
-//    std::copy(payload, payload + bytes, std::ostream_iterator<uint8_t>(std::cout));
-//    std::cout << "<<RX";
-
     static int xxx_data = 0;
     static std::chrono::system_clock::time_point xxx_last_tp = std::chrono::system_clock::now();
     xxx_data += bytes;
@@ -490,9 +527,8 @@ int main(int argc, char const* argv[])
         ("help,h", "produce help message")
         ("interface,i", po::value<std::string>()->required(), "wlan interface in monitor mode")
         ("packet,p", po::value<size_t>()->default_value(MAX_USER_PACKET_SIZE), "packet size")
-        ("id", po::value<uint8_t>()->required(), "station id")
-        ("rxport", po::value<uint16_t>()->default_value(DEFAULT_RX_PORT), "port to read data received from rfcom")
-        ("txport", po::value<uint16_t>()->default_value(DEFAULT_TX_PORT), "port to write data to send through rfcom")
+        ("id", po::value<uint8_t>()->required(), "local station id")
+        ("port", po::value<uint16_t>()->default_value(DEFAULT_PORT), "port to read data received from rfcom. Use port+1 to send data")
         ("loopback", po::value<bool>(), "relay all packets back");
 
     po::variables_map vm;
@@ -525,19 +561,23 @@ int main(int argc, char const* argv[])
         return 1;
     }
 
-    g_station_id = vm["id"].as<uint8_t>();
+    g_local_id = vm["id"].as<uint8_t>();
     g_loopback = vm["loopback"].empty() ? false : vm["loopback"].as<bool>();
 
-    uint16_t rx_port = vm["rxport"].empty() ? DEFAULT_RX_PORT : vm["rxport"].as<uint16_t>();
-    uint16_t tx_port = vm["txport"].empty() ? DEFAULT_TX_PORT : vm["txport"].as<uint16_t>();
+    uint16_t rx_port = vm["port"].empty() ? DEFAULT_PORT : vm["port"].as<uint16_t>();
+    uint16_t tx_port = rx_port + 1;
 
-    std::cout << "\n\nInterface: " << interface << ", id: " << g_station_id << "\n";
+    std::cout << "\n\nInterface: " << interface << ", Local id: " << g_local_id << "\n";
     std::cout << "Max packet size: " << g_max_packet_size << "\n";
     std::cout << "RX Port: " << rx_port << " TX Port: " << tx_port << "\n";
     std::cout << "Loopback data: " << g_loopback << "\n";
 
-    IEEE_HEADER[SRC_MAC_LASTBYTE] = g_station_id;
-    IEEE_HEADER[DST_MAC_LASTBYTE] = g_station_id;
+    IEEE_HEADER[SRC_MAC_LASTBYTE] = g_local_id;
+    IEEE_HEADER[DST_MAC_LASTBYTE] = g_local_id;
+
+    prepare_radiotap_header(g_rate_hz);
+
+
 
     char pcap_error[PCAP_ERRBUF_SIZE] = {0};
 
@@ -555,11 +595,10 @@ int main(int argc, char const* argv[])
 //        return 1;
 //    }
 
-    prepare_radiotap_header(g_rate_hz);
-
     prepare_tx_packet_header(g_pcap.loopback_buffer.data());
     prepare_tx_packet_header(g_asio.rx_buffer.data());
     g_pcap.tx_packet_header_length = RADIOTAP_HEADER.size() + sizeof(IEEE_HEADER);
+    std::cout << "Radiocap header size: " << RADIOTAP_HEADER.size() << ", IEEE header size: " << sizeof(IEEE_HEADER) << "\n";
 
     if (!prepare_filter())
     {
