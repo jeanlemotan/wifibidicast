@@ -15,6 +15,10 @@ rpi {
     LIBS += -lnl-genl-3
 }
 
+TARGET = wifibidicast
+target.path = /root
+INSTALLS = target
+
 
 CONFIG(debug, debug|release) {
 } else {
