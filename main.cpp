@@ -436,20 +436,21 @@ static bool process_rx_packet(PCAP& pcap)
     uint8_t payload_buffer[MAX_PACKET_SIZE];
     uint8_t* payload = payload_buffer;
 
-    std::lock_guard<std::mutex> lg(pcap.pcap_mutex);
-
     while (true)
     {
-        int retval = pcap_next_ex(pcap.pcap, &pcap_packet_header, (const u_char**)&payload);
-        if (retval < 0)
         {
-            std::cout << "Socket broken: " << pcap_geterr(pcap.pcap) << "\n";
-            return false;
-        }
-        if (retval != 1)
-        {
-            //no more packets
-            break;
+            std::lock_guard<std::mutex> lg(pcap.pcap_mutex);
+            int retval = pcap_next_ex(pcap.pcap, &pcap_packet_header, (const u_char**)&payload);
+            if (retval < 0)
+            {
+                std::cout << "Socket broken: " << pcap_geterr(pcap.pcap) << "\n";
+                return false;
+            }
+            if (retval != 1)
+            {
+                //no more packets
+                break;
+            }
         }
 
         size_t header_len = (payload[2] + (payload[3] << 8));
@@ -556,9 +557,9 @@ int main(int argc, char const* argv[])
     signal(SIGINT, signal_handler); // Trap basic signals (exit cleanly)
     signal(SIGKILL, signal_handler);
     signal(SIGUSR1, signal_handler);
-    signal(SIGQUIT, signal_handler);
-    signal(SIGABRT, signal_handler);
-    signal(SIGSTOP, signal_handler);
+//    signal(SIGQUIT, signal_handler);
+//    signal(SIGABRT, signal_handler);
+//    signal(SIGSTOP, signal_handler);
 
     namespace po = boost::program_options;
 
@@ -624,27 +625,58 @@ int main(int argc, char const* argv[])
         pcap.interface = interface;
 
         std::cout << "\n\nInterface: " << interface << ", Local id: " << g_local_id << "\n";
-        pcap.pcap = pcap_open_live(interface.c_str(), 2048, 1, -1, pcap_error);
+
+        pcap.pcap = pcap_create(interface.c_str(), pcap_error);
         if (pcap.pcap == nullptr)
         {
             std::cout << "Unable to open interface " << interface << " in pcap: " << pcap_error << "\n";
             return (1);
         }
-
-        std::cout << "Setting nonblocking pcap\n";
-        if(pcap_setnonblock(pcap.pcap, 1, pcap_error) < 0)
+        if (pcap_set_snaplen(pcap.pcap, 1800) < 0)
+        {
+            std::cout << "Error setting " << interface << " pcap_set_snaplen\n";
+            return 1;
+        }
+        if (pcap_set_promisc(pcap.pcap, 1) < 0)
+        {
+            std::cout << "Error setting " << interface << " pcap_set_promisc\n";
+            return 1;
+        }
+        if (pcap_set_rfmon(pcap.pcap, 1) < 0)
+        {
+            std::cout << "Error setting " << interface << " pcap_set_rfmon\n";
+            return 1;
+        }
+        if (pcap_set_timeout(pcap.pcap, -1) < 0)
+        {
+            std::cout << "Error setting " << interface << " pcap_set_timeout\n";
+            return 1;
+        }
+        if (pcap_set_immediate_mode(pcap.pcap, 0) < 0)
+        {
+            std::cout << "Error setting " << interface << " pcap_set_immediate_mode\n";
+            return 1;
+        }
+        if (pcap_set_buffer_size(pcap.pcap, 16000000) < 0)
+        {
+            std::cout << "Error setting " << interface << " pcap_set_buffer_size\n";
+            return 1;
+        }
+        if (pcap_activate(pcap.pcap) < 0)
+        {
+            std::cout << "Error setting " << interface << " pcap_activate\n";
+            return 1;
+        }
+        if (pcap_setnonblock(pcap.pcap, 1, pcap_error) < 0)
         {
             std::cout << "Error setting " << interface << " to nonblocking mode: " << pcap_error << "\n";
             return 1;
         }
-
-        std::cout << "Setting capture direction\n";
         if (pcap_setdirection(pcap.pcap, PCAP_D_IN) < 0)
         {
             std::cout << "Error setting " << interface << " capture direction: " << pcap_geterr(pcap.pcap);
             return 1;
         }
-
 
         prepare_tx_packet_header(pcap.tx_buffer.data());
 
