@@ -32,6 +32,10 @@
 
 
 
+static constexpr uint8_t MARKER_DATA = 0;
+static constexpr uint8_t MARKER_ACK = 1;
+
+
 extern "C"
 {
 #include "radiotap.h"
@@ -138,7 +142,7 @@ struct ASIO
     boost::asio::ip::udp::endpoint rx_endpoint;
     std::unique_ptr<boost::asio::ip::udp::socket> socket;
 
-    uint8_t* rx_buffer_ptr = nullptr;
+    std::array<uint8_t, MAX_USER_PACKET_SIZE> rx_buffer;
 
     std::mutex tx_buffer_mutex;
     std::vector<Buffer> tx_buffer_pool;
@@ -304,6 +308,29 @@ static void update_stats(PCAP& pcap, size_t rx_bytes, size_t tx_bytes)
 #endif
 }
 
+static void send_asio_packet_locked();
+
+static void send_ack()
+{
+    std::lock_guard<std::mutex> lg(g_asio.tx_buffer_mutex);
+    Buffer buffer;
+    if (g_asio.tx_buffer_pool.empty())
+    {
+        buffer = std::make_shared<Buffer::element_type>(1);
+    }
+    else
+    {
+        buffer = std::move(g_asio.tx_buffer_pool.back());
+        g_asio.tx_buffer_pool.pop_back();
+        buffer->resize(1);
+    }
+
+    buffer->front() = MARKER_ACK;
+    g_asio.tx_buffer_queue.push_back(std::move(buffer));
+
+    send_asio_packet_locked();
+}
+
 static void asio_rx_callback(const boost::system::error_code& error, std::size_t bytes_transferred)
 {
     if (error)
@@ -315,46 +342,59 @@ static void asio_rx_callback(const boost::system::error_code& error, std::size_t
     }
     else
     {
-        if (bytes_transferred > g_max_packet_size)
+        if (bytes_transferred > 0)
         {
-            std::cout << "Packet too big: " << bytes_transferred << ". Clamping to max packet size: " << g_max_packet_size;
-            bytes_transferred = g_max_packet_size;
-        }
+            if (g_asio.rx_buffer[0] == MARKER_DATA)
+            {
+                uint8_t* rx_buffer_ptr = g_asio.rx_buffer.data() + 1;
+                bytes_transferred--;
+
+                if (bytes_transferred > g_max_packet_size)
+                {
+                    std::cout << "Packet too big: " << bytes_transferred << ". Clamping to max packet size: " << g_max_packet_size;
+                    bytes_transferred = g_max_packet_size;
+                }
 
 #ifdef DEBUG_ASIO
-        std::cout << "ASIO RX>>";
-        std::copy(g_asio.rx_buffer_ptr, g_asio.rx_buffer_ptr + bytes_transferred, std::ostream_iterator<uint8_t>(std::cout));
-        std::cout << "<<ASIO RX";
+                std::cout << "ASIO RX>>";
+                std::copy(rx_buffer_ptr, rx_buffer_ptr + bytes_transferred, std::ostream_iterator<uint8_t>(std::cout));
+                std::cout << "<<ASIO RX";
 #endif
 
-        {
-            std::lock_guard<std::mutex> lg(g_pcap[0].pcap_mutex);
-            int isize = static_cast<int>(g_tx_packet_header_length + bytes_transferred);
-            int r = 0;
-            do
-            {
-                r = pcap_inject(g_pcap[0].pcap, g_pcap[0].tx_buffer.data(), isize);
-            } while (r < 0 && (errno == EWOULDBLOCK || errno == EAGAIN));
+                {
+                    std::lock_guard<std::mutex> lg(g_pcap[0].pcap_mutex);
+                    std::copy(rx_buffer_ptr, rx_buffer_ptr + bytes_transferred, g_pcap[0].tx_buffer.data() + g_tx_packet_header_length);
+                    int isize = static_cast<int>(g_tx_packet_header_length + bytes_transferred);
+                    int r = 0;
+                    do
+                    {
+                        r = pcap_inject(g_pcap[0].pcap, g_pcap[0].tx_buffer.data(), isize);
+                    } while (r < 0 && (errno == EWOULDBLOCK || errno == EAGAIN));
 
-            if (r <= 0)
-            {
-                std::cout << "Trouble injecting packet: " << r << " / " << isize << " : " << pcap_geterr(g_pcap[0].pcap) << "\n";
-            }
+                    if (r <= 0)
+                    {
+                        std::cout << "Trouble injecting packet: " << r << " / " << isize << " : " << pcap_geterr(g_pcap[0].pcap) << "\n";
+                    }
 
-            if (r > 0 && r != isize)
-            {
-                std::cout << "Incomplete packet sent: " << r << " / " << isize << "\n";
+                    if (r > 0 && r != isize)
+                    {
+                        std::cout << "Incomplete packet sent: " << r << " / " << isize << "\n";
+                    }
+                }
+
+                update_stats(g_pcap[0], 0, bytes_transferred);
+
+
+                send_ack();
             }
         }
 
-        update_stats(g_pcap[0], 0, bytes_transferred);
-
         g_asio.socket->async_receive_from(
-                    boost::asio::buffer(g_asio.rx_buffer_ptr, g_max_packet_size),
+                    boost::asio::buffer(g_asio.rx_buffer),
                     g_asio.rx_endpoint, g_asio.rx_callback);
     }
 }
-static void send_asio_packet_locked();
+
 
 static void asio_tx_callback(const boost::system::error_code& error, std::size_t bytes_transferred)
 {
@@ -415,14 +455,17 @@ static bool prepare_socket(uint16_t tx_port, uint16_t rx_port)
     g_asio.socket.reset(new boost::asio::ip::udp::socket(g_asio.io_service));
     g_asio.socket->open(boost::asio::ip::udp::v4());
     g_asio.socket->set_option(boost::asio::ip::udp::socket::reuse_address(true));
+    g_asio.socket->set_option(boost::asio::socket_base::receive_buffer_size(MAX_USER_PACKET_SIZE + 200));
+    g_asio.socket->set_option(boost::asio::socket_base::send_buffer_size(MAX_USER_PACKET_SIZE + 200));
     g_asio.socket->bind(g_asio.rx_endpoint);
+
 
 
     g_asio.tx_callback = boost::bind(&asio_tx_callback, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred);
     g_asio.rx_callback = boost::bind(&asio_rx_callback, boost::asio::placeholders::error, boost::asio::placeholders::bytes_transferred);
 
     g_asio.socket->async_receive_from(
-                boost::asio::buffer(g_asio.rx_buffer_ptr, g_max_packet_size),
+                boost::asio::buffer(g_asio.rx_buffer),
                 g_asio.rx_endpoint, g_asio.rx_callback);
 
     return true;
@@ -518,16 +561,17 @@ static bool process_rx_packet(PCAP& pcap)
             Buffer buffer;
             if (g_asio.tx_buffer_pool.empty())
             {
-                buffer = std::make_shared<Buffer::element_type>(bytes);
+                buffer = std::make_shared<Buffer::element_type>(bytes + 1);
             }
             else
             {
                 buffer = std::move(g_asio.tx_buffer_pool.back());
                 g_asio.tx_buffer_pool.pop_back();
-                buffer->resize(bytes);
+                buffer->resize(bytes + 1);
             }
 
-            std::copy(payload, payload + bytes, buffer->begin());
+            buffer->front() = MARKER_DATA;
+            std::copy(payload, payload + bytes, buffer->begin() + 1);
             g_asio.tx_buffer_queue.push_back(std::move(buffer));
 
             send_asio_packet_locked();
@@ -690,7 +734,7 @@ int main(int argc, char const* argv[])
     std::cout << "Radiocap header size: " << RADIOTAP_HEADER.size() << ", IEEE header size: " << sizeof(IEEE_HEADER) << "\n";
 
     //asio data will be received directly in the pcap tx buffer, just after the headers. This avoids a memcpy
-    g_asio.rx_buffer_ptr = g_pcap[0].tx_buffer.data() + g_tx_packet_header_length;
+    //g_asio.rx_buffer_ptr = g_pcap[0].tx_buffer.data() + g_tx_packet_header_length;
 
 
     if (!prepare_socket(rx_port, tx_port))
